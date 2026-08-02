@@ -1,7 +1,7 @@
 # qmg-memory 🧠✨
 
 > Persistent cross-session memory for Hermes Agent using **quantum-memory-graph** with pickle storage.
-> Remember decisions, preferences, bugs, deploy lessons — across restarts and sessions.
+> Remember decisions, preferences, bugs, lessons — across restarts and sessions.
 
 ---
 
@@ -46,11 +46,11 @@ PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
 graph = MemoryGraph.load(str(PERSIST_PATH)) if PERSIST_PATH.exists() else MemoryGraph()
 
 # Store a memory (auto-persists)
-store("Escrova: mainnet deploy uses Squads multisig 2/3 for program upgrades", graph=graph)
+store("Decision: use Anchor 0.30 for all new Solana programs — avoids IDL drift", graph=graph)
 graph.save(str(PERSIST_PATH))
 
 # Recall related memories
-results = recall("Escrova deploy multisig", K=5, graph=graph)
+results = recall("Anchor version decision", K=5, graph=graph)
 for r in results:
     print(f"📌 {r.text} (score: {r.score:.2f})")
 ```
@@ -59,8 +59,8 @@ for r in results:
 
 ## 💡 When to use
 
-- ✅ Remember architecture decisions, Zinc bugs, deploy lessons
-- ✅ Store user preferences, API quirks, environment specifics
+- ✅ Remember architecture decisions, debugging lessons, API quirks
+- ✅ Store user preferences, environment specifics, team conventions
 - ✅ Cross-reference related facts (graph magic ✨)
 - ❌ Not for: ephemeral session data, large blobs, real-time sync
 
