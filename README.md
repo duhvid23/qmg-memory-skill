@@ -76,12 +76,14 @@ python scripts/graphify_to_qmg.py path/to/repo/graphify-out/graph.json --project
     --test-query "where is authentication handled"
 ```
 
-- Re-running replaces that project's previous import; your own memories are untouched
+- Re-running replaces that project's previous import; your own memories are untouched, and an unchanged graph writes nothing
+- Writes into the shared `qmg_graph.pkl` when the hermes-qmg plugin is installed, under the same lock the plugin and qmg-mcp use (`<pickle>.bak` kept)
 - `--dry-run` previews, `--remove` deletes the import, `--symbols` stores every function (large)
-- The pickle is backed up to `memory_graph.pkl.bak` before each write
+- Self-check: `python tests/test_graphify_to_qmg.py` (uses a throwaway pickle)
 
-Example: graphify's own 55-file source became 204 memories in ~30s on CPU, and
-`recall("how does community detection work")` returned `cluster.py` first.
+Example: the hermes-qmg plugin source (15 files) became 55 memories; the write held the shared lock
+for 0.2s on a 1,100-memory graph, `recall("which function backs up the plugin before install")` returned
+`restore_backup()` first, and fact queries still returned the facts first.
 
 ---
 

@@ -13,6 +13,11 @@ into a few hundred recallable memories instead of one per symbol:
 
 Every memory is tagged with source "graphify:<project>". Re-running replaces
 the previous import for that project, so recall never returns stale structure.
+A re-run on an unchanged graph.json writes nothing.
+
+Writes are safe next to other writers (Hermes qmg plugin, qmg-mcp server):
+embeddings are computed first, then the script takes <pickle>.lock, reloads
+the pickle from disk, applies its changes and saves atomically (.bak kept).
 
 Usage:
   python graphify_to_qmg.py path/to/graphify-out/graph.json --project escrova
@@ -24,15 +29,32 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 SOURCE_PREFIX = "graphify:"
+LOCK_WAIT_S = 120   # give up if another writer holds the lock this long
+LOCK_BUDGET_S = 50  # qmg-mcp takes over a lock older than 60s; never save after this
+
+# Common credential shapes; code comments and docstrings occasionally carry them.
+SECRET_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"
+    r"|\b(?:sk|rk|pk)[-_](?:live|test|proj)[-_]?[A-Za-z0-9_\-]{16,}"
+    r"|\b(?:ghp|gho|ghs)_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}"
+    r"|\bxox[bap]-[A-Za-z0-9-]{10,}|\bAKIA[0-9A-Z]{16}\b|\bAIza[0-9A-Za-z_\-]{30,}"
+    r"|\bwhsec_[A-Za-z0-9]{8,}"
+    r"|\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+    r"|\b[1-9A-HJ-NP-Za-km-z]{86,90}\b"
+    r"|(?i:\b(?:api[_-]?key|secret|token|password|passwd)\s*[:=]\s*['\"]?[A-Za-z0-9_\-./+=]{12,})",
+    re.S,
+)
 
 # Edges that mean "A depends on B" when A and B live in different files.
 DEPENDENCY_RELATIONS = {
@@ -41,20 +63,20 @@ DEPENDENCY_RELATIONS = {
 }
 CALL_RELATIONS = {"calls", "indirect_call"}
 
-MAX_TEXT = 1000
+MAX_TEXT = 670  # Hermes prefetch shows at most ~700 chars of a hit
 MAX_LIST = 12
 MAX_ENTITIES = 16
 
 
 def default_persist_path() -> Path:
-    """Same location the qmg-memory skill uses."""
-    override = os.environ.get("QMG_PATH")
-    if override:
-        return Path(override).expanduser()
-    home = Path.home()
-    if os.name == "nt":
-        return home / "AppData" / "Local" / "hermes" / "qmg" / "memory_graph.pkl"
-    return home / ".hermes" / "qmg" / "memory_graph.pkl"
+    """$QMG_GRAPH_PATH or $QMG_PATH; else the hermes-qmg plugin's shared graph if
+    installed (qmg_graph.pkl), else this skill's own memory_graph.pkl."""
+    for var in ("QMG_GRAPH_PATH", "QMG_PATH"):
+        if os.environ.get(var):
+            return Path(os.environ[var]).expanduser()
+    base = Path.home() / ("AppData/Local/hermes" if os.name == "nt" else ".hermes") / "qmg"
+    shared = base / "qmg_graph.pkl"
+    return shared if shared.exists() else base / "memory_graph.pkl"
 
 
 @dataclass
@@ -63,6 +85,7 @@ class MemorySpec:
     text: str
     entities: list[str] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
+    files: list[str] = field(default_factory=list)  # source files it describes; sets its timestamp
 
 
 class GraphifyGraph:
@@ -132,7 +155,7 @@ class GraphifyGraph:
 
 
 def _clip(text: str, limit: int = MAX_TEXT) -> str:
-    text = " ".join(text.split())
+    text = SECRET_RE.sub("[REDACTED]", " ".join(text.split()))
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
@@ -156,7 +179,8 @@ def _entities(project: str, *groups) -> list[str]:
     return list(dict.fromkeys(e for e in out if e))[:MAX_ENTITIES]
 
 
-def build_memories(g: GraphifyGraph, project: str, hubs: int, symbols: bool, min_cluster: int) -> list[MemorySpec]:
+def build_memories(g: GraphifyGraph, project: str, hubs: int, symbols: bool, min_cluster: int,
+                   graph_path: Path, built: datetime) -> list[MemorySpec]:
     tag = f"[graphify:{project}]"
     specs: list[MemorySpec] = []
 
@@ -209,6 +233,7 @@ def build_memories(g: GraphifyGraph, project: str, hubs: int, symbols: bool, min
             text=_clip(text),
             entities=_entities(project, [src], sym_labels[:8], deps[:3]),
             metadata={"file": src, "symbols": len(syms)},
+            files=[src],
         ))
 
     # ---- clusters -------------------------------------------------------
@@ -234,6 +259,7 @@ def build_memories(g: GraphifyGraph, project: str, hubs: int, symbols: bool, min
             text=_clip(text),
             entities=_entities(project, files[:4], key_syms[:8]),
             metadata={"community": cid, "size": len(nids)},
+            files=files,
         ))
 
     # ---- hubs / symbols -------------------------------------------------
@@ -259,6 +285,7 @@ def build_memories(g: GraphifyGraph, project: str, hubs: int, symbols: bool, min
             text=_clip(text),
             entities=_entities(project, [g.label(nid), g.file_of(nid)], callers[:4], callees[:4]),
             metadata={"node_id": nid, "file": g.file_of(nid), "degree": g.degree[nid]},
+            files=[g.file_of(nid)],
         ))
 
     # ---- overview (first, so it is easy to spot) ----------------------
@@ -267,7 +294,8 @@ def build_memories(g: GraphifyGraph, project: str, hubs: int, symbols: bool, min
     overview = (
         f"{tag} Codebase overview for {project}: {len(all_files)} files,"
         f" {len(ranked_syms)} symbols, {len(g.links)} relationships"
-        f" (graphify {g.meta.get('graphify_version', '?')}, imported {datetime.now():%Y-%m-%d})."
+        f" (graphify {g.meta.get('graphify_version', '?')}, graph built {built:%Y-%m-%d})."
+        f" Query it: graphify query \"<question>\" --graph {graph_path.as_posix()}."
         f" Most depended-on files: {_join(top_files, 8)}."
         f" Largest clusters: {_join([names[c] for c, _ in biggest], 8)}."
         f" Top hubs: {_join([g.label(x) for x in ranked_syms[:8]], 8)}."
@@ -277,11 +305,63 @@ def build_memories(g: GraphifyGraph, project: str, hubs: int, symbols: bool, min
         text=_clip(overview),
         entities=_entities(project, top_files[:6]),
         metadata={"files": len(all_files), "symbols": len(ranked_syms)},
+        files=all_files,
     ))
     return specs
 
 
+def file_mtimes(graph_path: Path) -> dict[str, datetime]:
+    """Source-file mtimes graphify records in manifest.json beside graph.json ({} if absent)."""
+    try:
+        data = json.loads((graph_path.parent / "manifest.json").read_text(encoding="utf-8"))
+        return {f: datetime.fromtimestamp(v["mtime"]) for f, v in data.items()
+                if isinstance(v, dict) and isinstance(v.get("mtime"), (int, float))}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
 # ---------------------------------------------------------------- qmg I/O
+
+class GraphLock:
+    """<pickle>.lock created with O_EXCL: the protocol qmg-mcp/server.py and the hermes-qmg plugin use."""
+
+    def __init__(self, pickle_path: Path):
+        self.path = pickle_path.with_suffix(pickle_path.suffix + ".lock")
+
+    def __enter__(self):
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                if time.monotonic() > deadline:
+                    raise SystemExit(f"error: {self.path} held by another writer for {LOCK_WAIT_S}s; nothing changed")
+                time.sleep(0.2)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)  # closed so a stale-lock takeover can delete it on Windows
+        self.t0 = time.monotonic()
+        return self
+
+    def check_budget(self) -> None:
+        if time.monotonic() - self.t0 > LOCK_BUDGET_S:
+            raise SystemExit(f"error: lock held over {LOCK_BUDGET_S}s; nothing saved, re-run")
+
+    def __exit__(self, *exc):
+        self.path.unlink(missing_ok=True)
+        return False
+
+
+class PrecomputedEncoder:
+    """Stands in for the embedding model so add_memories_batch reuses vectors computed before locking."""
+
+    def __init__(self, table: dict):
+        self.table = table
+
+    def encode(self, texts, **_):
+        import numpy as np
+        return np.stack([self.table[t] for t in texts])
+
 
 def remove_project(graph, source: str) -> int:
     """Drop every memory a previous import stored under `source`."""
@@ -298,18 +378,19 @@ def remove_project(graph, source: str) -> int:
 
 
 def save_atomic(graph, path: Path) -> None:
-    """Back up the old pickle, then write the new one via rename so a crash never truncates it."""
+    """Write a temp file, back up the old pickle, then rename, so a crash never truncates it."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     os.close(fd)
     try:
         graph.save(tmp)
+        with open(tmp, "r+b") as fh:
+            os.fsync(fh.fileno())
+        if path.exists():
+            shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
         os.replace(tmp, path)
-    except BaseException:
+    finally:
         Path(tmp).unlink(missing_ok=True)
-        raise
 
 
 def main(argv=None) -> int:
@@ -321,7 +402,7 @@ def main(argv=None) -> int:
     p.add_argument("--symbols", action="store_true", help="store every callable symbol, not just hubs (large)")
     p.add_argument("--min-cluster", type=int, default=3, help="skip clusters smaller than this (default 3)")
     p.add_argument("--max-memories", type=int, default=3000, help="refuse to import more than this many (default 3000)")
-    p.add_argument("--model", default=None, help="sentence-transformers model for a NEW graph (default: qmg's)")
+    p.add_argument("--model", default=None, help="sentence-transformers model; must match the pickle's (default: qmg's)")
     p.add_argument("--dry-run", action="store_true", help="print the memories without touching the pickle")
     p.add_argument("--remove", action="store_true", help="only delete this project's imported memories")
     p.add_argument("--test-query", default=None, help="after import, run recall() with this query and print results")
@@ -333,10 +414,14 @@ def main(argv=None) -> int:
     qmg_path = (args.qmg_path or default_persist_path()).expanduser()
 
     specs: list[MemorySpec] = []
+    built, mtimes = datetime.now(), {}
     if not args.remove:
+        # stamp each memory with its newest source file's mtime (else the graph's build time),
+        # never "now": qmg boosts recent memories and links ones stamped in the same hour
+        built, mtimes = datetime.fromtimestamp(gpath.stat().st_mtime), file_mtimes(gpath)
         with open(gpath, encoding="utf-8") as fh:
             g = GraphifyGraph(json.load(fh))
-        specs = build_memories(g, project, args.hubs, args.symbols, args.min_cluster)
+        specs = build_memories(g, project, args.hubs, args.symbols, args.min_cluster, gpath, built)
         counts = Counter(s.kind for s in specs)
         print(f"{project}: {len(specs)} memories ({', '.join(f'{k}={v}' for k, v in counts.items())})")
         if len(specs) > args.max_memories:
@@ -349,33 +434,58 @@ def main(argv=None) -> int:
             return 0
 
     from quantum_memory_graph import MemoryGraph, recall
+    from quantum_memory_graph.graph import Memory
 
-    if qmg_path.exists():
-        graph = MemoryGraph.load(str(qmg_path))
-    else:
-        if args.remove:
-            print(f"nothing to remove: {qmg_path} does not exist")
-            return 0
-        graph = MemoryGraph(model=args.model) if args.model else MemoryGraph()
+    if args.remove and not qmg_path.exists():
+        print(f"nothing to remove: {qmg_path} does not exist")
+        return 0
 
-    removed = remove_project(graph, source)
-    print(f"removed {removed} previous memories for {source}")
-
+    # qmg ids hash the first 200 chars; keep one spec per id so none is silently merged
+    unique: dict[str, MemorySpec] = {}
+    for s in specs:
+        unique.setdefault(Memory.make_id(s.text), s)
+    specs = list(unique.values())
+    model_name = args.model or MemoryGraph.DEFAULT_MODEL
+    encoder, vectors = None, {}
     if specs:
-        ts = datetime.now()
-        stored = graph.add_memories_batch(
-            texts=[s.text for s in specs],
-            entities_list=[s.entities for s in specs],
-            timestamps=[ts] * len(specs),
-            sources=[source] * len(specs),
-        )
-        # add_memories_batch has no metadata argument; attach it afterwards.
-        for mem, spec in zip(stored, specs):
-            mem.metadata = {**spec.metadata, "kind": spec.kind, "graphify_graph": str(gpath)}
-        print(f"stored {len(stored)} memories")
+        # embed before taking the lock: other writers wait on it
+        from sentence_transformers import SentenceTransformer
+        encoder = SentenceTransformer(model_name)
+        texts = [s.text for s in specs]
+        vectors = dict(zip(texts, encoder.encode(texts, normalize_embeddings=True, show_progress_bar=False)))
 
-    save_atomic(graph, qmg_path)
-    print(f"saved {qmg_path}  stats={graph.stats()}")
+    with GraphLock(qmg_path) as lock:
+        graph = MemoryGraph.load(str(qmg_path)) if qmg_path.exists() else MemoryGraph(model=model_name)
+        if specs and graph._model_name != model_name:
+            raise SystemExit(f"error: {qmg_path} embeds with {graph._model_name}; re-run with --model {graph._model_name}")
+        old_texts = {m.text for m in graph.memories.values() if m.source == source}
+        if args.remove and not old_texts:
+            print(f"nothing to remove for {source}")
+            return 0
+        if not args.remove and old_texts == {s.text for s in specs}:
+            print(f"{source} is up to date ({len(old_texts)} memories); nothing written")
+            return 0
+
+        removed = remove_project(graph, source)
+        print(f"removed {removed} previous memories for {source}")
+        if specs:
+            graph._embedder = PrecomputedEncoder(vectors)
+            stored = graph.add_memories_batch(
+                texts=[s.text for s in specs],
+                entities_list=[s.entities for s in specs],
+                timestamps=[max((mtimes[f] for f in s.files if f in mtimes), default=built) for s in specs],
+                sources=[source] * len(specs),
+            )
+            graph._embedder = encoder  # same pickle shape qmg's own writers produce
+            # add_memories_batch has no metadata argument; attach it afterwards.
+            for mem, spec in zip(stored, specs):
+                mem.metadata = {**spec.metadata, "kind": spec.kind, "graphify_graph": str(gpath)}
+            print(f"stored {len(stored)} memories")
+        lock.check_budget()
+        save_atomic(graph, qmg_path)
+        held = time.monotonic() - lock.t0
+
+    print(f"saved {qmg_path} (lock held {held:.1f}s)  stats={graph.stats()}")
 
     if args.test_query:
         res = recall(args.test_query, K=5, graph=graph)

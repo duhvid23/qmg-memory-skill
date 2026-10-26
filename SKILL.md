@@ -77,12 +77,16 @@ result = recall("where is escrow release handled", K=5, graph=graph)
 ```
 
 Every imported memory starts with `[graphify:<project>]` and has `source="graphify:<project>"`.
-- Re-running the import **replaces** that project's previous memories (no stale structure). Your own memories are never touched.
+- Re-running the import **replaces** that project's previous memories (no stale structure). Your own memories are never touched. If nothing changed, nothing is written.
+- Target pickle: `$QMG_GRAPH_PATH`, else `$QMG_PATH`, else the shared `qmg_graph.pkl` when the hermes-qmg plugin is installed, else `memory_graph.pkl`. `--qmg-path` overrides all.
+- Safe next to other writers (Hermes plugin, qmg-mcp server): it embeds first, then takes `<pickle>.lock`, reloads from disk, saves atomically and keeps `<pickle>.bak`. It refuses to write if the lock stays busy for 120s.
+- Each memory is stamped with its source file's last-modified time from graphify's `manifest.json` (else the graph's build time), never the import time, so a fresh import does not outrank your facts through the recency boost.
+- Text is capped at 670 chars (Hermes shows ~700 per hit) and common credential shapes in comments and docstrings are replaced with `[REDACTED]`.
 - `--dry-run` prints what would be stored without loading the model or touching the pickle.
 - `--remove` deletes only that project's imported memories.
 - `--hubs N` (default 25), `--symbols` (all callables, large), `--max-memories` (default 3000 safety cap).
 - `--test-query "..."` runs a recall right after import to check quality.
-- The pickle is backed up to `memory_graph.pkl.bak` and written atomically on every import.
+- Self-check (throwaway pickle, never your graph): `python tests/test_graphify_to_qmg.py`
 
 Re-sync after significant code changes (or wire `graphify update` + the import into a git hook).
 
