@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -112,6 +113,13 @@ def main() -> None:
             lock.write_text("12345")  # another writer took the lock over after a stall
         assert lock.exists(), "must not delete another writer's lock"
         lock.unlink()
+
+        lock.write_text("999999")  # left behind by a crashed writer
+        old = time.time() - 2 * bridge.STALE_LOCK_S
+        os.utime(lock, (old, old))
+        with bridge.GraphLock(pkl):
+            pass
+        assert not lock.exists(), "a stale lock must be taken over"
 
         code, out = run(*args, "--remove")
         assert code == 0, out

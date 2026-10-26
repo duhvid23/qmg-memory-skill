@@ -41,7 +41,8 @@ from pathlib import Path
 
 SOURCE_PREFIX = "graphify:"
 LOCK_WAIT_S = 120   # give up if another writer holds the lock this long
-LOCK_BUDGET_S = 50  # qmg-mcp takes over a lock older than 60s; never save after this
+STALE_LOCK_S = 60   # a lock this old was left by a crashed writer (same rule as qmg-mcp and the plugin)
+LOCK_BUDGET_S = 50  # others take over a lock older than STALE_LOCK_S; never save after this
 
 # Common credential shapes; code comments and docstrings occasionally carry them.
 SECRET_RE = re.compile(
@@ -336,11 +337,17 @@ class GraphLock:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 break
             except FileExistsError:
+                try:  # a lock older than STALE_LOCK_S was left by a crashed writer: take it over
+                    if time.time() - self.path.stat().st_mtime > STALE_LOCK_S:
+                        self.path.unlink()
+                        continue
+                except OSError:  # released meanwhile, or still open by a live writer on Windows
+                    pass
                 if time.monotonic() > deadline:
                     raise SystemExit(f"error: {self.path} held by another writer for {LOCK_WAIT_S}s; nothing changed")
                 time.sleep(0.2)
         os.write(fd, str(os.getpid()).encode())
-        os.close(fd)  # closed so a stale-lock takeover can delete it on Windows
+        os.close(fd)  # if we stall past STALE_LOCK_S others may take over; check_budget then stops our save
         self.t0 = time.monotonic()
         return self
 
