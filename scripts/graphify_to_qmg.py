@@ -329,6 +329,7 @@ class GraphLock:
         self.path = pickle_path.with_suffix(pickle_path.suffix + ".lock")
 
     def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + LOCK_WAIT_S
         while True:
             try:
@@ -348,7 +349,12 @@ class GraphLock:
             raise SystemExit(f"error: lock held over {LOCK_BUDGET_S}s; nothing saved, re-run")
 
     def __exit__(self, *exc):
-        self.path.unlink(missing_ok=True)
+        # after a stall another writer may have taken over the lock; only remove our own
+        try:
+            if self.path.read_text() == str(os.getpid()):
+                self.path.unlink()
+        except FileNotFoundError:
+            pass
         return False
 
 
@@ -379,7 +385,6 @@ def remove_project(graph, source: str) -> int:
 
 def save_atomic(graph, path: Path) -> None:
     """Write a temp file, back up the old pickle, then rename, so a crash never truncates it."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     os.close(fd)
     try:
@@ -464,28 +469,25 @@ def main(argv=None) -> int:
             return 0
         if not args.remove and old_texts == {s.text for s in specs}:
             print(f"{source} is up to date ({len(old_texts)} memories); nothing written")
-            return 0
-
-        removed = remove_project(graph, source)
-        print(f"removed {removed} previous memories for {source}")
-        if specs:
-            graph._embedder = PrecomputedEncoder(vectors)
-            stored = graph.add_memories_batch(
-                texts=[s.text for s in specs],
-                entities_list=[s.entities for s in specs],
-                timestamps=[max((mtimes[f] for f in s.files if f in mtimes), default=built) for s in specs],
-                sources=[source] * len(specs),
-            )
-            graph._embedder = encoder  # same pickle shape qmg's own writers produce
-            # add_memories_batch has no metadata argument; attach it afterwards.
-            for mem, spec in zip(stored, specs):
-                mem.metadata = {**spec.metadata, "kind": spec.kind, "graphify_graph": str(gpath)}
-            print(f"stored {len(stored)} memories")
-        lock.check_budget()
-        save_atomic(graph, qmg_path)
-        held = time.monotonic() - lock.t0
-
-    print(f"saved {qmg_path} (lock held {held:.1f}s)  stats={graph.stats()}")
+        else:
+            removed = remove_project(graph, source)
+            print(f"removed {removed} previous memories for {source}")
+            if specs:
+                graph._embedder = PrecomputedEncoder(vectors)
+                stored = graph.add_memories_batch(
+                    texts=[s.text for s in specs],
+                    entities_list=[s.entities for s in specs],
+                    timestamps=[max((mtimes[f] for f in s.files if f in mtimes), default=built) for s in specs],
+                    sources=[source] * len(specs),
+                )
+                graph._embedder = encoder  # same pickle shape qmg's own writers produce
+                # add_memories_batch has no metadata argument; attach it afterwards.
+                for mem, spec in zip(stored, specs):
+                    mem.metadata = {**spec.metadata, "kind": spec.kind, "graphify_graph": str(gpath)}
+                print(f"stored {len(stored)} memories")
+            lock.check_budget()
+            save_atomic(graph, qmg_path)
+            print(f"saved {qmg_path} (lock held {time.monotonic() - lock.t0:.1f}s)  stats={graph.stats()}")
 
     if args.test_query:
         res = recall(args.test_query, K=5, graph=graph)

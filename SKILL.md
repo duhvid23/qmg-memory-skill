@@ -31,11 +31,13 @@ from pathlib import Path
 from quantum_memory_graph import MemoryGraph, store, recall
 
 def qmg_path() -> Path:
-    if os.environ.get("QMG_PATH"):
-        return Path(os.environ["QMG_PATH"]).expanduser()
-    if os.name == "nt":
-        return Path.home() / "AppData" / "Local" / "hermes" / "qmg" / "memory_graph.pkl"
-    return Path.home() / ".hermes" / "qmg" / "memory_graph.pkl"
+    # same rule as scripts/graphify_to_qmg.py, so recall also sees imported code maps
+    for var in ("QMG_GRAPH_PATH", "QMG_PATH"):
+        if os.environ.get(var):
+            return Path(os.environ[var]).expanduser()
+    base = Path.home() / ("AppData/Local/hermes" if os.name == "nt" else ".hermes") / "qmg"
+    shared = base / "qmg_graph.pkl"  # the hermes-qmg plugin's graph, shared with other agents
+    return shared if shared.exists() else base / "memory_graph.pkl"
 
 PERSIST_PATH = qmg_path()
 PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -43,9 +45,12 @@ PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
 # Load once per execute_code session
 graph = MemoryGraph.load(str(PERSIST_PATH)) if PERSIST_PATH.exists() else MemoryGraph()
 
-# Store, then save
-store("Decision: use Anchor 0.30 for all new Solana programs — avoids IDL drift", graph=graph)
-graph.save(str(PERSIST_PATH))
+# Store, then save. Never save the shared qmg_graph.pkl from here: other agents write it
+# under a lock, and saving this session's copy would erase their changes. There, store
+# through Hermes' memory tool or the qmg MCP `qmg_store` instead.
+if PERSIST_PATH.name != "qmg_graph.pkl":
+    store("Decision: use Anchor 0.30 for all new Solana programs — avoids IDL drift", graph=graph)
+    graph.save(str(PERSIST_PATH))
 
 # recall() returns a dict; the hits are in result["memories"]
 result = recall("Anchor version decision", K=5, graph=graph)
@@ -91,7 +96,7 @@ Every imported memory starts with `[graphify:<project>]` and has `source="graphi
 Re-sync after significant code changes (or wire `graphify update` + the import into a git hook).
 
 ## Persistence details
-- Storage: `%USERPROFILE%\AppData\Local\hermes\qmg\memory_graph.pkl` (Windows) or `~/.hermes/qmg/memory_graph.pkl` (Linux/macOS); override with `QMG_PATH`
+- Storage: `$QMG_GRAPH_PATH` or `$QMG_PATH` if set; else the hermes-qmg plugin's shared `qmg_graph.pkl` when it exists (read it here, store through Hermes or `qmg_store`); else `%USERPROFILE%\AppData\Local\hermes\qmg\memory_graph.pkl` (Windows) or `~/.hermes/qmg/memory_graph.pkl` (Linux/macOS)
 - Load once per `execute_code` session; reuse the same `graph` instance for multiple operations
 - Call `graph.save(...)` after storing; `store()` itself does not write to disk
 - The `graph` parameter is optional in `store()`/`recall()`; if omitted, an ephemeral in-memory graph is used
